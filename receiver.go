@@ -10,31 +10,67 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
 // Receiver is a struct to receive messages from SQS and schedule them for processing
 type Receiver struct {
-	// Client is the SQS client
+	// Client is the SQS client.
 	// This member is required.
 	Client *sqs.Client
-	// ReceiveMessageInput is the input for the ReceiveMessage operation
-	// This member is required
+
+	// ReceiveMessageInput is the input for the ReceiveMessage operation.
+	// This member is required.
 	ReceiveMessageInput *sqs.ReceiveMessageInput
-	// Concurrency is the number of concurrent workers to process messages
-	// If this member is not set, default concurrency 1 will be used.
+
+	// Concurrency is the number of concurrent workers to process messages.
+	// This is different from the number of messages received from SQS and this number
+	// represents pool size of concurrently running task goroutines. For example, if you
+	// have ReceiveMessageInput.MaxNumberOfMessages set to 3 and Concurrency member set to 2,
+	// then you can receive 3 messages (if available) from SQS in one call and first two
+	// messages will be added to the pool to be processed concurrently, while third message
+	// will be waiting for at least one of the first two to be finished. Meanwhile, next 3
+	// messages will be read from SQS and will be waiting for pool to get free slots.
+	// Good start point (if you have multiple worker instances running in the cluster) will
+	// be to set ReceiveMessageInput.MaxNumberOfMessages = 1 and Concurrency higher than 1,
+	// depending on the capacity of your worker instance.
+	//
+	// If Concurrency member is not set, default concurrency 1 will be used.
 	Concurrency int
-	// ReceiverProcessorConfig is the configuration for the Processor
+
+	// PerMessageConfig is the configuration for the Processor
 	// Each received message will be passed to this function first to get the
-	// per-message configuration. If this member is not set, default configuration
-	// will be used:
+	// per-message configuration.
+	// For informational purposes - there is a queueVisTimeout parameter that is
+	// passed to the Processor function, which contains SQS queue's default
+	// Visibility Timeout value.
+	//
+	// If this member is not set, default configuration will be used:
 	//		AllowLongRunningTasks=false
-	PerMessageConfig func(ctx context.Context, msg *types.Message) *PerMessageConfig
-	// Processor is the function to process the received message
-	// This member is required
+	PerMessageConfig func(ctx context.Context, msg *types.Message, queueVisTimeout int) *PerMessageConfig
+
+	// Processor is the function to process the received message. It should return
+	// an error if the message processing failed, and you want for the message to be
+	// visible again in the queue to give it a chance to be processed again (e.g. if
+	// there was a temporary issue with the message processing, such as network error
+	// while calling to external service or database etc). If the message processing
+	// was successful or even if it failed, but you don't want for it to go back to
+	// queue, then you should return nil.
+	// Remember, that if message is panicked, it will crash the entire Receiver.Listen
+	// function, and it many cases it is undesired, so make sure to handle panics inside
+	// the Processor function.
+	//
+	// This member is required.
 	Processor func(ctx context.Context, msg *types.Message) error
+
 	// Logger
+	// This member is optional and if not provided - default StdOut WARN-level logger
+	// will be created.
 	Logger *slog.Logger
+
+	recvCancelFn context.CancelFunc
+	activeTasks  atomic.Int32
 }
 
 // PerMessageConfig is the configuration for the Processor
@@ -46,6 +82,14 @@ type PerMessageConfig struct {
 	// in case of failure, the message will be visible again after new Visibility Timeout.
 	// By default, this flag is set to false and does not allow long-running tasks
 	AllowLongRunningTasks bool
+	// ExpectedProcessingTime is the expected time in seconds that the Processor will take to process the
+	// message. This is useful if you use a single queue for multiple types of messages, and some messages
+	// require more time (usually much more than your queue's default Visibility Timeout setting) to process
+	// than others. It will allow background tracking task to extend message's Visibility Timeout by the value
+	// specified in this member, reducing number of ChangeVisibilityTimeout API calls to AWS.
+	// This member is optional and if not set, then the default value of queue's visibility timeout
+	// will be used.
+	ExpectedProcessingTime int
 }
 
 // Listen starts listening to the queue and processing the messages
@@ -61,7 +105,7 @@ func (r *Receiver) Listen(ctx context.Context) error {
 	}
 
 	if r.Logger == nil {
-		r.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		r.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	}
 
 	qattrs, err := r.Client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
@@ -79,10 +123,17 @@ func (r *Receiver) Listen(ctx context.Context) error {
 	}
 
 	sync := newConcurrencyChannel(r.Concurrency)
+	recvCtx, recvCancel := context.WithCancel(ctx)
+	r.recvCancelFn = recvCancel
+
 	for {
-		result, err := r.Client.ReceiveMessage(ctx, r.ReceiveMessageInput)
+		result, err := r.Client.ReceiveMessage(recvCtx, r.ReceiveMessageInput)
 		if err != nil {
-			r.Logger.ErrorContext(ctx, "[gosqstask] failed to receive message from queue", err)
+			if errors.Is(err, context.Canceled) {
+				r.Logger.InfoContext(ctx, fmt.Sprintf("[gosqstask] canceled listening queue: %v", err))
+				break
+			}
+			r.Logger.ErrorContext(ctx, fmt.Sprintf("[gosqstask] failed to receive message from queue: %v", err))
 			continue
 		}
 		if len(result.Messages) == 0 {
@@ -92,21 +143,43 @@ func (r *Receiver) Listen(ctx context.Context) error {
 
 		for i := range result.Messages {
 			msg := &result.Messages[i]
-			msgIdLog := slog.String("messageId", *msg.MessageId)
+			msgIdLog := slog.Group("attr",
+				slog.String("messageId", *msg.MessageId),
+				slog.String("text", *msg.Body))
+
+			var msgCfg *PerMessageConfig
+			if r.PerMessageConfig != nil {
+				msgCfg = r.PerMessageConfig(ctx, msg, queueVisTimeout)
+			} else {
+				msgCfg = &PerMessageConfig{}
+			}
+			if msgCfg.ExpectedProcessingTime == 0 {
+				msgCfg.ExpectedProcessingTime = queueVisTimeout
+			}
+
+			if msgCfg.ExpectedProcessingTime != queueVisTimeout {
+				if err = r.changeMsgVisibility(ctx, msg.ReceiptHandle, msgCfg.ExpectedProcessingTime); err != nil {
+					r.Logger.ErrorContext(ctx,
+						fmt.Sprintf("[gosqstask] failed to reset message visibility timeout "+""+
+							"(error is ignored): %v", err),
+						msgIdLog)
+				}
+			}
+
 			beforeWait := time.Now()
 			<-sync
 			afterWait := time.Now()
 			r.Logger.DebugContext(ctx, "[gosqstask] message is getting ready to be processed", msgIdLog)
 			if afterWait.Sub(beforeWait) > time.Second*1 {
-				r.Logger.DebugContext(ctx, "[gosqstask] reset message visibility after pool wait", msgIdLog)
+				r.Logger.DebugContext(ctx, "[gosqstask] update message visibility after pool wait", msgIdLog)
 				// It is possible that "<-sync" blocked message processing for some time,
 				// and it is better to extend its visibility timeout before processing
-				if err = r.changeMessageVisibility(ctx, msg.ReceiptHandle, queueVisTimeout); err != nil {
+				if err = r.changeMsgVisibility(ctx, msg.ReceiptHandle, msgCfg.ExpectedProcessingTime); err != nil {
 					if !r.isMessageExpiredError(ctx, err, msgIdLog, "after pool wait") {
-						r.Logger.WarnContext(ctx,
+						r.Logger.WarnContext(ctx, fmt.Sprintf(
 							"[gosqstask] failed to reset message visibility timeout after pool wait "+
-								"(error is not critical and ignored, message will be processed next time):",
-							err, msgIdLog)
+								"(error is not critical and ignored, message will be processed next time): %v",
+							err), msgIdLog)
 					}
 					sync <- struct{}{}
 					continue
@@ -114,45 +187,70 @@ func (r *Receiver) Listen(ctx context.Context) error {
 			}
 
 			// Launch a new goroutine to process the message
-			go func(ctx context.Context, msg *types.Message) {
+			go func(ctx context.Context, msg *types.Message, perMsgCfg *PerMessageConfig) {
 				r.Logger.DebugContext(ctx, "[gosqstask] message is being processed", msgIdLog)
-				defer func() { sync <- struct{}{} }()
-				ctx, cancel := context.WithCancel(context.WithValue(ctx, "messageId", *msg.MessageId))
+				defer func() {
+					r.activeTasks.Add(-1)
+					sync <- struct{}{}
+				}()
+				r.activeTasks.Add(1)
+				r.processMessage(ctx, msg, perMsgCfg, msgIdLog)
+			}(ctx, msg, msgCfg)
+		}
+	}
+	return nil
+}
 
-				var perMsgCfg *PerMessageConfig
-				if r.PerMessageConfig != nil {
-					perMsgCfg = r.PerMessageConfig(ctx, msg)
-				} else {
-					perMsgCfg = &PerMessageConfig{}
-				}
-				// If AllowLongRunningTasks is set to true, then create a new background tracking task
-				if perMsgCfg.AllowLongRunningTasks {
-					go func(ctx context.Context) {
-						r.longRunningTaskTracker(ctx, msgIdLog, msg.ReceiptHandle, queueVisTimeout)
-					}(ctx)
-				}
-
-				err = r.Processor(ctx, msg)
-				if err != nil {
-					r.Logger.ErrorContext(ctx, "[gosqstask] failed to process message:", err, msgIdLog)
-				} else {
-					_, err := r.Client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
-						QueueUrl:      r.ReceiveMessageInput.QueueUrl,
-						ReceiptHandle: msg.ReceiptHandle,
-					})
-					if err != nil {
-						r.Logger.ErrorContext(ctx, "[gosqstask] failed to delete message from queue", err, msgIdLog)
-					} else {
-						r.Logger.DebugContext(ctx, "[gosqstask] message processed successfully", msgIdLog)
-					}
-				}
-				cancel()
-			}(ctx, msg)
+// Shutdown will gracefully shutdown the receiver. First, it will stop receiving new messages
+// from SQS, and then it will wait up to "maxWait" duration for all currently processing messages to
+// be finished.
+func (r *Receiver) Shutdown(ctx context.Context) {
+	if r.recvCancelFn != nil {
+		r.recvCancelFn()
+	}
+	for {
+		select {
+		case <-time.After(1 * time.Second):
+			if r.activeTasks.Load() == 0 {
+				r.Logger.InfoContext(ctx, "Shutdown initiated because no active tasks left")
+				return
+			}
+		case <-ctx.Done():
+			r.Logger.InfoContext(ctx, fmt.Sprintf("Shutdown initiated because context is done: %v", ctx.Err()))
+			return
 		}
 	}
 }
 
-func (r *Receiver) changeMessageVisibility(ctx context.Context, msgReceipt *string, visTimeout int) error {
+func (r *Receiver) processMessage(ctx context.Context, msg *types.Message, cfg *PerMessageConfig, msgIdLog slog.Attr) {
+	ctx, cancel := context.WithCancel(context.WithValue(ctx, "messageId", *msg.MessageId))
+
+	// If AllowLongRunningTasks is set to true, then create a new background tracking task
+	if cfg.AllowLongRunningTasks {
+		go func(ctx context.Context) {
+			r.longRunningTaskTracker(ctx, msgIdLog, msg.ReceiptHandle, cfg.ExpectedProcessingTime)
+		}(ctx)
+	}
+
+	err := r.Processor(ctx, msg)
+	if err != nil {
+		r.Logger.ErrorContext(ctx, fmt.Sprintf("[gosqstask] failed to process message: %v", err), msgIdLog)
+	} else {
+		_, err := r.Client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+			QueueUrl:      r.ReceiveMessageInput.QueueUrl,
+			ReceiptHandle: msg.ReceiptHandle,
+		})
+		if err != nil {
+			r.Logger.ErrorContext(ctx, fmt.Sprintf("[gosqstask] failed to delete message from queue: %v", err),
+				msgIdLog)
+		} else {
+			r.Logger.DebugContext(ctx, "[gosqstask] message processed successfully", msgIdLog)
+		}
+	}
+	cancel()
+}
+
+func (r *Receiver) changeMsgVisibility(ctx context.Context, msgReceipt *string, visTimeout int) error {
 	_, err := r.Client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
 		QueueUrl:          r.ReceiveMessageInput.QueueUrl,
 		ReceiptHandle:     msgReceipt,
@@ -162,13 +260,16 @@ func (r *Receiver) changeMessageVisibility(ctx context.Context, msgReceipt *stri
 }
 
 func (r *Receiver) longRunningTaskTracker(ctx context.Context, msgIdLog slog.Attr, msgReceipt *string, visTimeout int) {
-	t := time.NewTicker(time.Second * time.Duration(visTimeout*3/4))
+	// Start a ticker to extend message visibility timeout in case if after 3/4 of the original
+	// visibility timeout the processing is still not finished
+	borderlineTimeout := visTimeout * 3 / 4
+	t := time.NewTicker(time.Second * time.Duration(borderlineTimeout))
 	defer t.Stop()
-	r.Logger.DebugContext(ctx, "[gosqstask] long running task tracker is started", msgIdLog)
+	r.Logger.DebugContext(ctx, "[gosqstask] task tracker is started", msgIdLog)
 	for {
 		select {
 		case <-ctx.Done():
-			r.Logger.DebugContext(ctx, "[gosqstask] shut down long running task tracker", msgIdLog)
+			r.Logger.DebugContext(ctx, "[gosqstask] shut down task tracker", msgIdLog)
 			return
 		case <-t.C:
 			if ctx.Err() != nil {
@@ -176,17 +277,15 @@ func (r *Receiver) longRunningTaskTracker(ctx context.Context, msgIdLog slog.Att
 				return
 			}
 			r.Logger.DebugContext(ctx,
-				fmt.Sprintf("[gosqstask] extending message visibility timeout for %d seconds", visTimeout),
+				fmt.Sprintf("[gosqstask] extending message visibility timeout for %d seconds", borderlineTimeout),
 				msgIdLog)
-			_, err := r.Client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
-				QueueUrl:          r.ReceiveMessageInput.QueueUrl,
-				ReceiptHandle:     msgReceipt,
-				VisibilityTimeout: int32(visTimeout),
-			})
+
+			err := r.changeMsgVisibility(ctx, msgReceipt, borderlineTimeout)
 			if err != nil {
-				if !r.isMessageExpiredError(ctx, err, msgIdLog, "in long running task tracker") {
-					r.Logger.ErrorContext(ctx, "[gosqstask] failed to extend message visibility timeout "+
-						"in long running task tracker", err, msgIdLog)
+				if !r.isMessageExpiredError(ctx, err, msgIdLog, "in task tracker") {
+					r.Logger.ErrorContext(ctx, fmt.Sprintf(
+						"[gosqstask] failed to extend message visibility timeout in task tracker: %v",
+						err), msgIdLog)
 				}
 			}
 		}
@@ -201,8 +300,8 @@ func (r *Receiver) isMessageExpiredError(ctx context.Context, err error, msgIdLo
 				"because most likely message has been already expired (error is not critical and ignored, "+
 				"message will be processed next time, but for performance reasons our suggestion is "+
 				"to increase Receiver.Concurrency value or/and increase Visibility Timeout in "+
-				"SQS queue settings):", op),
-			err, msgIdLog)
+				"SQS queue settings): %v", op, err),
+			msgIdLog)
 		return true
 	}
 	return false

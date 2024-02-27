@@ -1,10 +1,13 @@
-# GoSQSTask
+# GoSqsTask
 
-GoSQSTask is a library for handling AWS SQS tasks in Go. It supports customizable
-concurrency (to handle multiple tasks at once), and provides an automatic support
-for handling long-running tasks (tasks that take longer than the visibility timeout).
-Framework takes care of the visibility timeout in SQS queues and automatically extends
-it if needed.
+GoSqsTask solves AWS SQS related tasks in Go. It supports:
+
+- Customizable concurrency (to handle multiple tasks at once)
+- Graceful shutdown with deadline cancellation of all tasks in progress.
+- Automatic handling of long-running tasks. Library provides background task trackers to deal
+  with visibility timeout of SQS queue messages and automatically extends it if task execution
+  happens to be longer than expected visibility timeout. This prevents messages from being
+  processed more than one by different consumer listeners.
 
 ## Installation
 
@@ -13,6 +16,10 @@ go get github.com/mobiletoly/gosqstask
 ```
 
 ## Usage
+
+Here is a very simple example of how to use GoSQSTask to receive messages from SQS,
+but make sure to refer to the documentation inside the receiver.go code for more
+information about the configuration options.
 
 ```go
 queue := "https://..."
@@ -23,7 +30,7 @@ recv := &gosqstask.Receiver{
     ReceiveMessageInput: &sqs.ReceiveMessageInput{
         // SQS queue URL
         QueueUrl:            &queue,
-        // Receive one message at a time from SQS (good for balancing between multiple microservice instances)
+        // Receive one message at a time from SQS
         MaxNumberOfMessages: 1,
         // Enable long polling (20 seconds is good in most cases)
         WaitTimeSeconds:     20,
@@ -47,7 +54,7 @@ recv := &gosqstask.Receiver{
     Processor: func (ctx context.Context, msg *types.Message) error {
         slog.InfoContext(ctx, fmt.Sprintf("-------> RECEIVED %s / messageId=%s",
             *msg.Body, *msg.MessageId))
-        time.Sleep(20 * time.Second) // Simulate long-running task
+        time.Sleep(30 * time.Second) // Simulate long-running task
         slog.InfoContext(ctx, fmt.Sprintf("<------- PROCESSED %s / messageId=%s",
             *msg.Body, *msg.MessageId))
         return nil
@@ -58,8 +65,22 @@ recv := &gosqstask.Receiver{
 }
 
 // Launch the receiver
-if err = recv.Listen(ctx); err != nil {
-    panic(err)
-}
+go func() {
+    if err = recv.Listen(ctx); err != nil {
+        panic(err)
+    }
+}()
 
+// React to Interrupt signal that can be received by pressing Ctrl+C,
+// by stopping debugger or when process is getting terminated in the
+// microservice instance. In this case we perform graceful shutdown.
+// (read more about Shutdown method in receive.go source code comments)
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, os.Interrupt)
+<-quit
+slog.Info("Server is shutting down")
+ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+defer cancel()
+recv.Shutdown(ctx)
+slog.Info("Shutdown is complete")
 ```

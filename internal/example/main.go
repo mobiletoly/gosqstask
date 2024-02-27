@@ -9,6 +9,7 @@ import (
 	"github.com/mobiletoly/gosqstask"
 	"log/slog"
 	"os"
+	"os/signal"
 	"time"
 )
 
@@ -41,17 +42,26 @@ func main() {
 		// them concurrently. Once one of the tasks is finished, the next message will be
 		// read from SQS and added to the pool.
 		Concurrency: 3,
-		// You can customize the per-message configuration. For example you can check
+		// You can customize the per-message configuration. For example, you can check
 		// if message you received requires long-running task and set AllowLongRunningTasks
 		// to true. This will start a separate goroutine that will keep extending the
 		// visibility timeout of the message in SQS.
-		PerMessageConfig: func(_ context.Context, msg *types.Message) *gosqstask.PerMessageConfig {
+		PerMessageConfig: func(_ context.Context, msg *types.Message, _ int) *gosqstask.PerMessageConfig {
 			return &gosqstask.PerMessageConfig{
 				AllowLongRunningTasks: true,
 			}
 		},
 		// This is the function that will be called for each message received from SQS.
 		Processor: func(ctx context.Context, msg *types.Message) error {
+			defer func() {
+				// Recover from panic and log it, without crashing the entire SQS listener
+				// You might need it for more complicated message handling logic
+				if r := recover(); r != nil {
+					slog.ErrorContext(ctx, fmt.Sprintf("Recovered from panic (messageId=%s): %v",
+						*msg.MessageId, r))
+				}
+			}()
+
 			slog.InfoContext(ctx, fmt.Sprintf("-------> RECEIVED %s / messageId=%s",
 				*msg.Body, *msg.MessageId))
 			time.Sleep(20 * time.Second) // Simulate long-running task
@@ -64,7 +74,18 @@ func main() {
 		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 
-	if err = recv.Listen(ctx); err != nil {
-		panic(err)
-	}
+	go func() {
+		if err = recv.Listen(ctx); err != nil {
+			panic(err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+	slog.Info("Server is shutting down")
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	recv.Shutdown(ctx)
+	slog.Info("Shutdown is complete")
 }
