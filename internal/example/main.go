@@ -17,11 +17,13 @@ func main() {
 	ctx := context.TODO()
 	awscfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
-		println("Error loading AWS configuration:", err)
+		panic(fmt.Sprintf("Error loading AWS configuration: %v", err))
 	}
 
+	// TODO put your SQS URL here
+	queue := "https://..."
+
 	sqsc := sqs.NewFromConfig(awscfg)
-	queue := "..." // TODO put your SQS URL here
 	recv := &gosqstask.Receiver{
 		Client: sqsc,
 		ReceiveMessageInput: &sqs.ReceiveMessageInput{
