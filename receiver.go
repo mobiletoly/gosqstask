@@ -13,8 +13,7 @@ import (
 	"time"
 )
 
-type ReceiverProcessor func(message *types.Message) error
-
+// Receiver is a struct to receive messages from SQS and schedule them for processing
 type Receiver struct {
 	// Client is the SQS client
 	// This member is required.
@@ -38,6 +37,7 @@ type Receiver struct {
 	Logger *slog.Logger
 }
 
+// PerMessageConfig is the configuration for the Processor
 type PerMessageConfig struct {
 	// AllowLongRunningTasks is a flag to allow long-running tasks, task can potentially take longer than
 	// queue's Visibility Timeout. In this case Receiver will create a new background tracking task that will
@@ -48,6 +48,7 @@ type PerMessageConfig struct {
 	AllowLongRunningTasks bool
 }
 
+// Listen starts listening to the queue and processing the messages
 func (r *Receiver) Listen(ctx context.Context) error {
 	if r.Client == nil {
 		return errors.New("member Receiver.Client is required")
@@ -95,6 +96,7 @@ func (r *Receiver) Listen(ctx context.Context) error {
 			beforeWait := time.Now()
 			<-sync
 			afterWait := time.Now()
+			r.Logger.DebugContext(ctx, "[gosqstask] message is getting ready to be processed", msgIdLog)
 			if afterWait.Sub(beforeWait) > time.Second*1 {
 				r.Logger.DebugContext(ctx, "[gosqstask] reset message visibility after pool wait", msgIdLog)
 				// It is possible that "<-sync" blocked message processing for some time,
@@ -111,10 +113,8 @@ func (r *Receiver) Listen(ctx context.Context) error {
 				}
 			}
 
-			r.Logger.DebugContext(ctx, "[gosqstask] message received from SQS", msgIdLog)
-
 			// Launch a new goroutine to process the message
-			go func(msg *types.Message) {
+			go func(ctx context.Context, msg *types.Message) {
 				r.Logger.DebugContext(ctx, "[gosqstask] message is being processed", msgIdLog)
 				defer func() { sync <- struct{}{} }()
 				ctx, cancel := context.WithCancel(context.WithValue(ctx, "messageId", *msg.MessageId))
@@ -147,7 +147,7 @@ func (r *Receiver) Listen(ctx context.Context) error {
 					}
 				}
 				cancel()
-			}(msg)
+			}(ctx, msg)
 		}
 	}
 }
