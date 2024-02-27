@@ -46,10 +46,10 @@ recv := &gosqstask.Receiver{
     // This is the function that will be called for each message received from SQS.
     Processor: func (ctx context.Context, msg *types.Message) error {
         slog.InfoContext(ctx, fmt.Sprintf("-------> RECEIVED %s / messageId=%s",
-        *msg.Body, *msg.MessageId))
+            *msg.Body, *msg.MessageId))
         time.Sleep(20 * time.Second) // Simulate long-running task
         slog.InfoContext(ctx, fmt.Sprintf("<------- PROCESSED %s / messageId=%s",
-        *msg.Body, *msg.MessageId))
+            *msg.Body, *msg.MessageId))
         return nil
     },
     // Optional logger. If not provided, it will use a default logger that
