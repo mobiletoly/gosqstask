@@ -41,17 +41,17 @@ recv := &gosqstask.Receiver{
     // them concurrently. Once one of the tasks is finished, the next message will be
     // read from SQS and added to the pool.
     Concurrency: 3,
-    // You can customize the per-message configuration. For example you can check
+    // You can customize the per-message configuration. For example, you can check
     // if message you received requires long-running task and set AllowLongRunningTasks
     // to true. This will start a separate goroutine that will keep extending the
     // visibility timeout of the message in SQS.
-    PerMessageConfig: func (_ context.Context, msg *types.Message) *gosqstask.PerMessageConfig {
-        return &gosqstask.PerMessageConfig{
-            AllowLongRunningTasks: true,
+    MessageConfig: func (_ context.Context, msg *types.Message, _ int) gosqstask.MessageConfig {
+        return gosqstask.MessageConfig{
+            ProcessRequest: gosqstask.ProcessRequestLongRunning,
         }
     },
     // This is the function that will be called for each message received from SQS.
-    Processor: func (ctx context.Context, msg *types.Message) error {
+    Processor: func (ctx context.Context, msg *types.Message, _ gosqstask.MessageConfig) error {
         slog.InfoContext(ctx, fmt.Sprintf("-------> RECEIVED %s / messageId=%s",
             *msg.Body, *msg.MessageId))
         time.Sleep(30 * time.Second) // Simulate long-running task

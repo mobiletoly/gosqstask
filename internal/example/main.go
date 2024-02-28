@@ -46,13 +46,13 @@ func main() {
 		// if message you received requires long-running task and set AllowLongRunningTasks
 		// to true. This will start a separate goroutine that will keep extending the
 		// visibility timeout of the message in SQS.
-		PerMessageConfig: func(_ context.Context, msg *types.Message, _ int) *gosqstask.PerMessageConfig {
-			return &gosqstask.PerMessageConfig{
-				AllowLongRunningTasks: true,
+		MessageConfig: func(_ context.Context, msg *types.Message, _ int) gosqstask.MessageConfig {
+			return gosqstask.MessageConfig{
+				ProcessRequest: gosqstask.ProcessRequestLongRunning,
 			}
 		},
 		// This is the function that will be called for each message received from SQS.
-		Processor: func(ctx context.Context, msg *types.Message, _ *gosqstask.PerMessageConfig) error {
+		Processor: func(ctx context.Context, msg *types.Message, _ gosqstask.MessageConfig) error {
 			defer func() {
 				// Recover from panic and log it, without crashing the entire SQS listener
 				// You might need it for more complicated message handling logic

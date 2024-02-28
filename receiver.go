@@ -39,7 +39,7 @@ type Receiver struct {
 	// If Concurrency member is not set, default concurrency 1 will be used.
 	Concurrency int
 
-	// PerMessageConfig is the configuration for the Processor
+	// MessageConfig is the per-message configuration for the Processor
 	// Each received message will be passed to this function first to get the
 	// per-message configuration.
 	// For informational purposes - there is a queueVisTimeout parameter that is
@@ -48,7 +48,7 @@ type Receiver struct {
 	//
 	// If this member is not set, default configuration will be used:
 	//		AllowLongRunningTasks=false
-	PerMessageConfig func(ctx context.Context, msg *types.Message, queueVisTimeout int) *PerMessageConfig
+	MessageConfig func(ctx context.Context, msg *types.Message, queueVisTimeout int) MessageConfig
 
 	// Processor is the function to process the received message. It should return
 	// an error if the message processing failed, and you want for the message to be
@@ -62,7 +62,7 @@ type Receiver struct {
 	// the Processor function.
 	//
 	// This member is required.
-	Processor func(ctx context.Context, msg *types.Message, cfg *PerMessageConfig) error
+	Processor func(ctx context.Context, msg *types.Message, cfg MessageConfig) error
 
 	// Logger
 	// This member is optional and if not provided - default StdOut WARN-level logger
@@ -73,15 +73,35 @@ type Receiver struct {
 	activeTasks  atomic.Int32
 }
 
-// PerMessageConfig is the configuration for the Processor
-type PerMessageConfig struct {
-	// AllowLongRunningTasks is a flag to allow long-running tasks, task can potentially take longer than
-	// queue's Visibility Timeout. In this case Receiver will create a new background tracking task that will
-	// be measuring the time since the SQS message was received and if it exceeds the Visibility Timeout,
-	// then message's Visibility Timeout will be extended to remain invisible to other consumers and
-	// in case of failure, the message will be visible again after new Visibility Timeout.
-	// By default, this flag is set to false and does not allow long-running tasks
-	AllowLongRunningTasks bool
+type ProcessRequest int
+
+const (
+	// ProcessRequestDefault is the default status that instructs the Receiver to process the message
+	// normally, withing the queue's default Visibility Timeout
+	ProcessRequestDefault ProcessRequest = iota
+
+	// ProcessRequestLongRunning is a status to allow long-running tasks, task can potentially take longer than
+	//	queue's Visibility Timeout. In this case Receiver will create a new background tracking task that will
+	//	be measuring the time since the SQS message was received and if it exceeds the Visibility Timeout,
+	//	then message's Visibility Timeout will be extended to remain invisible to other consumers and
+	//	in case of failure, the message will be visible again after new Visibility Timeout.
+	ProcessRequestLongRunning
+
+	// ProcessRequestSkip is a status to skip the message processing for current consumer. This message
+	// will be returned back to queue
+	ProcessRequestSkip
+
+	// ProcessRequestDelete is a status to delete the message from the queue without processing it
+	ProcessRequestDelete
+)
+
+// MessageConfig is the configuration for the Processor
+type MessageConfig struct {
+	// ProcessRequest is the status to instruct the Receiver how to process the message.
+	// Refer to ProcessRequest constants for more information
+	// By default ProcessRequestNormal is used
+	ProcessRequest ProcessRequest
+
 	// ExpectedProcessingTime is the expected time in seconds that the Processor will take to process the
 	// message. This is useful if you use a single queue for multiple types of messages, and some messages
 	// require more time (usually much more than your queue's default Visibility Timeout setting) to process
@@ -90,6 +110,7 @@ type PerMessageConfig struct {
 	// This member is optional and if not set, then the default value of queue's visibility timeout
 	// will be used.
 	ExpectedProcessingTime int
+
 	// User-specific data. This member is optional and can be used to store any user-specific data.
 	// As an example - you receive a message from SQS and in order to estimate the processing time
 	// you need to unmarshal a payload from the message body to inspect some fields to make a decision
@@ -153,14 +174,29 @@ func (r *Receiver) Listen(ctx context.Context) error {
 				slog.String("messageId", *msg.MessageId),
 				slog.String("text", *msg.Body))
 
-			var msgCfg *PerMessageConfig
-			if r.PerMessageConfig != nil {
-				msgCfg = r.PerMessageConfig(ctx, msg, queueVisTimeout)
-			} else {
-				msgCfg = &PerMessageConfig{}
+			var msgCfg MessageConfig
+			if r.MessageConfig != nil {
+				msgCfg = r.MessageConfig(ctx, msg, queueVisTimeout)
 			}
 			if msgCfg.ExpectedProcessingTime == 0 {
 				msgCfg.ExpectedProcessingTime = queueVisTimeout
+			}
+
+			if msgCfg.ProcessRequest == ProcessRequestSkip {
+				continue
+			}
+			if msgCfg.ProcessRequest == ProcessRequestDelete {
+				_, err := r.Client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+					QueueUrl:      r.ReceiveMessageInput.QueueUrl,
+					ReceiptHandle: msg.ReceiptHandle,
+				})
+				if err != nil {
+					r.Logger.ErrorContext(ctx,
+						fmt.Sprintf("[gosqstask] failed to delete message from queue according "+
+							"to ProcessRequest command: %v", err),
+						msgIdLog)
+				}
+				continue
 			}
 
 			if msgCfg.ExpectedProcessingTime != queueVisTimeout {
@@ -193,14 +229,14 @@ func (r *Receiver) Listen(ctx context.Context) error {
 			}
 
 			// Launch a new goroutine to process the message
-			go func(ctx context.Context, msg *types.Message, perMsgCfg *PerMessageConfig) {
+			go func(ctx context.Context, msg *types.Message, msgCfg MessageConfig) {
 				r.Logger.DebugContext(ctx, "[gosqstask] message is being processed", msgIdLog)
 				defer func() {
 					r.activeTasks.Add(-1)
 					sync <- struct{}{}
 				}()
 				r.activeTasks.Add(1)
-				r.processMessage(ctx, msg, perMsgCfg, msgIdLog)
+				r.processMessage(ctx, msg, msgCfg, msgIdLog)
 			}(ctx, msg, msgCfg)
 		}
 	}
@@ -228,11 +264,11 @@ func (r *Receiver) Shutdown(ctx context.Context) {
 	}
 }
 
-func (r *Receiver) processMessage(ctx context.Context, msg *types.Message, cfg *PerMessageConfig, msgIdLog slog.Attr) {
+func (r *Receiver) processMessage(ctx context.Context, msg *types.Message, cfg MessageConfig, msgIdLog slog.Attr) {
 	ctx, cancel := context.WithCancel(context.WithValue(ctx, "messageId", *msg.MessageId))
 
 	// If AllowLongRunningTasks is set to true, then create a new background tracking task
-	if cfg.AllowLongRunningTasks {
+	if cfg.ProcessRequest == ProcessRequestLongRunning {
 		go func(ctx context.Context) {
 			r.longRunningTaskTracker(ctx, msgIdLog, msg.ReceiptHandle, cfg.ExpectedProcessingTime)
 		}(ctx)
