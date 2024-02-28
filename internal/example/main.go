@@ -52,7 +52,7 @@ func main() {
 			}
 		},
 		// This is the function that will be called for each message received from SQS.
-		Processor: func(ctx context.Context, msg *types.Message) error {
+		Processor: func(ctx context.Context, msg *types.Message, _ *gosqstask.PerMessageConfig) error {
 			defer func() {
 				// Recover from panic and log it, without crashing the entire SQS listener
 				// You might need it for more complicated message handling logic

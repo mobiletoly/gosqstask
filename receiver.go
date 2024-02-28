@@ -62,7 +62,7 @@ type Receiver struct {
 	// the Processor function.
 	//
 	// This member is required.
-	Processor func(ctx context.Context, msg *types.Message) error
+	Processor func(ctx context.Context, msg *types.Message, cfg *PerMessageConfig) error
 
 	// Logger
 	// This member is optional and if not provided - default StdOut WARN-level logger
@@ -90,6 +90,12 @@ type PerMessageConfig struct {
 	// This member is optional and if not set, then the default value of queue's visibility timeout
 	// will be used.
 	ExpectedProcessingTime int
+	// User-specific data. This member is optional and can be used to store any user-specific data.
+	// As an example - you receive a message from SQS and in order to estimate the processing time
+	// you need to unmarshal a payload from the message body to inspect some fields to make a decision
+	// about the processing time. You can store this unmarshalled data in UserData member and then
+	// use it in the Processor function to avoid deserializing payload again
+	UserData any
 }
 
 // Listen starts listening to the queue and processing the messages
@@ -232,7 +238,7 @@ func (r *Receiver) processMessage(ctx context.Context, msg *types.Message, cfg *
 		}(ctx)
 	}
 
-	err := r.Processor(ctx, msg)
+	err := r.Processor(ctx, msg, cfg)
 	if err != nil {
 		r.Logger.ErrorContext(ctx, fmt.Sprintf("[gosqstask] failed to process message: %v", err), msgIdLog)
 	} else {
